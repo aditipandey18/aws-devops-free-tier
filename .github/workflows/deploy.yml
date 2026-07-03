@@ -12,5 +12,5 @@ jobs:
 
       - name: Deploy to EC2
         run: |
-          ssh -i ${{ secrets.EC2_KEY }} ec2-user@<EC2-IP> 'cd /home/ec2-user/app && git pull && npm install && pm2 restart all'
+          ssh -i ${{ DevOps }} ec2-user@54.177.212.169 'cd /home/ec2-user/app && git pull && npm install && pm2 restart all'
 
