@@ -1,0 +1,409 @@
+# AWS Free-Tier DevOps Project — Complete Step-by-Step Guide
+
+**Stack:** Node.js (Express) · AWS EC2 · S3 · API Gateway (optional) · IAM · Security Groups · GitHub Actions · CloudWatch · k6
+
+---
+
+## 0. Architecture Overview
+
+```
+                    ┌─────────────────────┐
+   Internet ───────▶│  Security Group      │
+                    │  (80/443/22 only)    │
+                    └──────────┬───────────┘
+                               │
+                    ┌──────────▼───────────┐
+                    │   EC2 (t2.micro)     │
+                    │  ┌─────────────────┐ │        ┌──────────────┐
+                    │  │ Nginx (reverse  │ │        │  CloudWatch  │
+                    │  │ proxy + TLS)    │ │───────▶│  Agent →     │
+                    │  └────────┬────────┘ │        │  Logs/Metrics│
+                    │  ┌────────▼────────┐ │        └──────────────┘
+                    │  │ Node.js/Express │ │
+                    │  │ (PM2 process)   │ │
+                    │  └────────┬────────┘ │
+                    └───────────┼───────────┘
+                                │
+                       ┌────────▼────────┐
+                       │   Amazon S3     │
+                       │ (assets/backups)│
+                       └─────────────────┘
+
+  GitHub ──push to main──▶ GitHub Actions ──SSH deploy──▶ EC2
+  (Optional) API Gateway ──HTTP proxy──▶ EC2 (for rate limiting / API key mgmt)
+  IAM Role attached to EC2 → grants least-privilege access to S3/CloudWatch
+```
+
+Use this as the basis for your "architecture diagram" deliverable — recreate it in draw.io, Lucidchart, or the AWS free diagramming tool ([app.diagrams.net](https://app.diagrams.net)) using official AWS icons for the final report.
+
+---
+
+## Part 1 — AWS Account & IAM Setup (Least Privilege)
+
+### 1.1 Create an IAM user for yourself (don't use root)
+1. AWS Console → **IAM** → **Users** → **Create user**.
+2. Name: `devops-admin`. Enable **console access**.
+3. Attach policy: `AdministratorAccess` (only for your personal learning account; in production you'd scope this down).
+4. Save the generated credentials somewhere safe. Log out of root, log back in as this user for everything below.
+
+### 1.2 Create an IAM Role for EC2 (least privilege for the app)
+This is the role your EC2 instance will assume — it should only be able to touch the S3 bucket and write CloudWatch logs/metrics, nothing else.
+
+1. **IAM** → **Roles** → **Create role**.
+2. Trusted entity: **AWS service** → **EC2**.
+3. Attach these managed policies:
+   - `CloudWatchAgentServerPolicy`
+   - Create a **custom policy** instead of `AmazonS3FullAccess` (least privilege):
+     ```json
+     {
+       "Version": "2012-10-17",
+       "Statement": [
+         {
+           "Effect": "Allow",
+           "Action": ["s3:GetObject", "s3:PutObject", "s3:ListBucket"],
+           "Resource": [
+             "arn:aws:s3:::YOUR-BUCKET-NAME",
+             "arn:aws:s3:::YOUR-BUCKET-NAME/*"
+           ]
+         }
+       ]
+     }
+     ```
+4. Name the role `EC2-App-Role`. You'll attach it when launching the EC2 instance.
+
+### 1.3 Create a deploy-only IAM user (optional, for CI/CD)
+If your GitHub Actions pipeline needs AWS API access (not just SSH), create a separate `github-actions-deploy` user with an access key scoped to only what's needed (e.g., S3 read/write). For the SSH-based pipeline in this guide, you mainly need SSH keys, not AWS credentials, in GitHub Secrets.
+
+---
+
+## Part 2 — Networking: VPC & Security Groups
+
+Free tier gives you a **default VPC** already — you don't need to create one from scratch.
+
+### 2.1 Create a Security Group
+1. **EC2** → **Security Groups** → **Create security group**.
+2. Name: `app-sg`. Description: "Web app security group".
+3. VPC: default.
+4. **Inbound rules:**
+   | Type | Port | Source | Purpose |
+   |---|---|---|---|
+   | SSH | 22 | *Your IP only* (`My IP`) | Admin access |
+   | HTTP | 80 | 0.0.0.0/0 | Public web traffic |
+   | HTTPS | 443 | 0.0.0.0/0 | Encrypted web traffic |
+5. **Outbound rules:** leave default (all traffic allowed) — the app needs to reach npm registry, S3, CloudWatch.
+
+This satisfies "Configure Security Groups and firewall rules" with least-privilege SSH access.
+
+---
+
+## Part 3 — Launch and Configure EC2
+
+1. **EC2** → **Launch instance**.
+2. Name: `app-server`.
+3. AMI: **Ubuntu Server 22.04 LTS** (free tier eligible).
+4. Instance type: **t2.micro** (free tier).
+5. Key pair: create new → `app-key.pem` → **download and keep it safe** (you cannot re-download).
+6. Network settings: select your default VPC, **attach `app-sg`** security group created above.
+7. Storage: 8–20 GB gp3 (free tier covers up to 30 GB).
+8. **Advanced details** → IAM instance profile → select `EC2-App-Role`.
+9. Launch instance.
+
+### 3.1 Connect and set up the server
+```bash
+chmod 400 app-key.pem
+ssh -i app-key.pem ubuntu@<EC2_PUBLIC_IP>
+```
+
+Install Node.js, PM2, Nginx, and the CloudWatch Agent:
+```bash
+# Update system
+sudo apt update && sudo apt upgrade -y
+
+# Install Node.js 20.x
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs git nginx
+
+# Install PM2 (process manager, keeps app alive & restarts on crash)
+sudo npm install -g pm2
+pm2 startup systemd -u ubuntu --hp /home/ubuntu
+# (run the command it prints, prefixed with sudo)
+```
+
+---
+
+## Part 4 — Deploy the Sample Application
+
+The sample Express API is in the `/app` folder of this project. Key endpoints:
+- `GET /` — welcome/info
+- `GET /health` — health check (use for monitoring/load balancer)
+- `GET /api/items`, `POST /api/items`, `GET /api/items/:id` — simple CRUD to load-test
+- `GET /api/backups` — lists objects in your S3 bucket
+- `GET /api/compute` — CPU-bound endpoint, useful for generating CPU load for CloudWatch alarms
+
+### 4.1 Get the code onto EC2
+```bash
+cd /home/ubuntu
+git clone https://github.com/<your-username>/<your-repo>.git app
+cd app/app
+npm install --production
+```
+
+### 4.2 Run with PM2
+```bash
+export S3_BUCKET_NAME=your-bucket-name
+export AWS_REGION=ap-south-1
+pm2 start server.js --name aws-sample-api
+pm2 save
+```
+Verify: `curl http://localhost:3000/health`
+
+### 4.3 Put Nginx in front (reverse proxy on port 80)
+```bash
+sudo tee /etc/nginx/sites-available/app <<'EOF'
+server {
+    listen 80;
+    server_name _;
+
+    location / {
+        proxy_pass http://localhost:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_cache_bypass $http_upgrade;
+    }
+}
+EOF
+
+sudo ln -s /etc/nginx/sites-available/app /etc/nginx/sites-enabled/
+sudo rm -f /etc/nginx/sites-enabled/default
+sudo nginx -t && sudo systemctl restart nginx
+```
+
+Now `http://<EC2_PUBLIC_IP>/` should return your app's JSON response.
+
+---
+
+## Part 5 — Amazon S3 for Assets/Backups
+
+1. **S3** → **Create bucket**.
+2. Name: something globally unique, e.g. `yourname-app-backups-2026`.
+3. Region: same as your EC2 instance.
+4. Block all public access: **keep enabled** (best practice — access only via IAM role, not public URLs).
+5. Create bucket.
+
+### 5.1 Test access from EC2 (using the attached IAM role — no keys needed)
+```bash
+aws s3 ls s3://yourname-app-backups-2026
+echo "test backup" > backup.txt
+aws s3 cp backup.txt s3://yourname-app-backups-2026/
+```
+If this works without configuring `aws configure`, your IAM role is correctly attached.
+
+### 5.2 Example use: nightly backup cron job
+```bash
+crontab -e
+# add:
+0 2 * * * tar -czf /home/ubuntu/backup-$(date +\%F).tar.gz /home/ubuntu/app && aws s3 cp /home/ubuntu/backup-$(date +\%F).tar.gz s3://yourname-app-backups-2026/backups/
+```
+
+---
+
+## Part 6 — API Gateway (Optional Layer)
+
+Since your app already runs on EC2, API Gateway is optional here — it's most useful if you want to add **rate limiting, API keys, or a custom domain** in front of your EC2 app without modifying app code.
+
+1. **API Gateway** → **Create API** → **HTTP API**.
+2. Integration: **HTTP** (not Lambda) → point to `http://<EC2_PUBLIC_IP>` (or better, a Network Load Balancer if you want this production-grade — skip NLB for free tier).
+3. Configure routes, e.g. `ANY /{proxy+}` → forwards all paths to your EC2 app.
+4. Add a **usage plan** with an API key and throttling (e.g., 10 req/sec) to demonstrate rate limiting for your report.
+5. Deploy to a stage (e.g. `prod`) → note the invoke URL.
+
+> Note in your report: API Gateway + EC2 (not Lambda) is a valid but slightly unusual pattern — mention this was done to demonstrate API Gateway configuration since the app runs on a persistent EC2 instance rather than serverless functions.
+
+---
+
+## Part 7 — HTTPS Setup
+
+### Option A — Free domain + Let's Encrypt (recommended if you own/can get a domain)
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+sudo certbot --nginx -d yourdomain.com
+```
+Certbot auto-edits your Nginx config and sets up auto-renewal.
+
+### Option B — No domain: self-signed cert (for demo purposes only)
+```bash
+sudo mkdir -p /etc/nginx/ssl
+sudo openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/selfsigned.key \
+  -out /etc/nginx/ssl/selfsigned.crt \
+  -subj "/CN=<EC2_PUBLIC_IP>"
+```
+Then add a `listen 443 ssl;` server block in Nginx referencing these files. Browsers will show a warning (expected — no CA signed it), but it demonstrates HTTPS configuration for the assignment.
+
+Also update your Security Group: port 443 inbound should already be open from Part 2.
+
+---
+
+## Part 8 — CI/CD Pipeline (GitHub Actions)
+
+The workflow file is at `.github/workflows/deploy.yml` in this project. It:
+1. Runs on every push to `main`.
+2. Installs dependencies and does a basic sanity check.
+3. SSHes into EC2, pulls the latest code, reinstalls dependencies, and restarts the app via PM2.
+
+### 8.1 Add GitHub Secrets
+Repo → **Settings** → **Secrets and variables** → **Actions** → **New repository secret**:
+| Secret | Value |
+|---|---|
+| `EC2_HOST` | Your EC2 public IP |
+| `EC2_USER` | `ubuntu` |
+| `EC2_SSH_KEY` | Contents of your `app-key.pem` file |
+| `S3_BUCKET_NAME` | Your bucket name |
+| `AWS_REGION` | e.g. `ap-south-1` |
+
+### 8.2 First-time EC2 prep for git-based deploys
+```bash
+mkdir -p /home/ubuntu/app
+cd /home/ubuntu/app
+git clone https://github.com/<your-username>/<your-repo>.git .
+```
+
+Now every `git push origin main` will auto-deploy. Take a screenshot of a successful GitHub Actions run for your deliverables.
+
+---
+
+## Part 9 — CloudWatch Monitoring, Dashboards & Alarms
+
+### 9.1 Install & configure the CloudWatch Agent on EC2
+```bash
+wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-cloudwatch-agent.deb
+sudo dpkg -i amazon-cloudwatch-agent.deb
+
+sudo tee /opt/aws/amazon-cloudwatch-agent/etc/config.json <<'EOF'
+{
+  "agent": { "metrics_collection_interval": 60, "run_as_user": "root" },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/home/ubuntu/app/app/logs/app.log",
+            "log_group_name": "/app/access-logs",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  },
+  "metrics": {
+    "namespace": "CustomAppMetrics",
+    "metrics_collected": {
+      "mem": { "measurement": ["mem_used_percent"] },
+      "disk": { "measurement": ["used_percent"], "resources": ["/"] },
+      "cpu": { "measurement": ["cpu_usage_idle", "cpu_usage_user"], "totalcpu": true }
+    }
+  }
+}
+EOF
+
+sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+  -a fetch-config -m ec2 -s \
+  -c file:/opt/aws/amazon-cloudwatch-agent/etc/config.json
+```
+This collects **application logs** (satisfies "Collect application logs") plus memory/disk/CPU custom metrics.
+
+### 9.2 Build a Dashboard
+1. **CloudWatch** → **Dashboards** → **Create dashboard** → name `AppMonitoring`.
+2. Add widgets:
+   - EC2 `CPUUtilization` (built-in, no agent needed)
+   - `NetworkIn` / `NetworkOut`
+   - Custom `mem_used_percent`, `disk_used_percent` (from agent)
+   - Log widget showing recent lines from `/app/access-logs`
+
+### 9.3 Create Alarms
+1. **CloudWatch** → **Alarms** → **Create alarm**.
+2. Metric: EC2 → `CPUUtilization` → threshold **> 70% for 5 minutes**.
+3. Notification: create an **SNS topic**, subscribe your email.
+4. Repeat for a `StatusCheckFailed` alarm (instance health) and optionally a high-memory alarm using the custom metric.
+
+Take screenshots of the dashboard and a triggered/test alarm for your deliverables.
+
+---
+
+## Part 10 — Load Testing with k6
+
+Script is at `load-test/script.js`.
+
+### 10.1 Install k6 (run this from your local machine, not EC2, to simulate real external users)
+```bash
+# macOS
+brew install k6
+# Ubuntu/Debian
+sudo gpg -k
+sudo gpg --no-default-keyring --keyring /usr/share/keyrings/k6-archive-keyring.gpg --keyserver hkp://keyserver.ubuntu.com:80 --recv-keys C5AD17C747E3415A3642D57D77C6C491D6AC1D69
+echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" | sudo tee /etc/apt/sources.list.d/k6.list
+sudo apt-get update && sudo apt-get install k6
+```
+
+### 10.2 Run the test
+```bash
+k6 run --env BASE_URL=http://<EC2_PUBLIC_IP> load-test/script.js
+```
+
+### 10.3 Metrics k6 gives you automatically (record these in your report)
+- `http_req_duration` — latency (avg, p90, p95, p99)
+- `http_reqs` — throughput (requests/sec)
+- `http_req_failed` — error rate
+- Combine with the CloudWatch dashboard (CPU/memory) captured **during the same test window** to correlate load with resource usage.
+
+### 10.4 Export results as HTML/JSON for your report
+```bash
+k6 run --out json=results.json --env BASE_URL=http://<EC2_PUBLIC_IP> load-test/script.js
+```
+Use a tool like [k6 HTML reporter](https://github.com/benc-uk/k6-reporter) or simply paste key metrics + a screenshot of terminal output into your report.
+
+---
+
+## Part 11 — Analyze Bottlenecks & Suggest Optimizations
+
+In your final report, structure this section as:
+
+| Observation | Likely Cause | Suggested Optimization |
+|---|---|---|
+| p95 latency spikes above ~50 concurrent users | Single t2.micro vCPU saturated, Node.js is single-threaded | Use PM2 cluster mode (`pm2 start server.js -i max`) to use all vCPUs; consider a larger instance or Auto Scaling Group |
+| CPU hits 100% during `/api/compute` calls | Synchronous CPU-bound loop blocks the event loop | Offload heavy computation to a worker thread or separate microservice |
+| Error rate rises during traffic spikes | No load balancing / single point of failure | Add an Application Load Balancer + Auto Scaling Group across 2+ instances |
+| High latency variability | T2 burstable CPU credits exhausted | Monitor `CPUCreditBalance` metric; move to `t3` or non-burstable type under sustained load |
+| Disk I/O during logging | Synchronous file writes | Use async logging / ship logs directly via CloudWatch Agent instead of writing to disk first |
+
+Tailor this table to what you *actually observe* in your own k6 run + CloudWatch data — reviewers will expect real numbers, not just theory.
+
+---
+
+## Part 12 — Deliverables Checklist
+
+| Deliverable | Where to get it |
+|---|---|
+| Git repository | Push this whole project (`app/`, `.github/`, `load-test/`) to GitHub |
+| Deployment guide | This document |
+| Architecture diagram | Recreate the ASCII diagram in Part 0 using draw.io/Lucidchart with AWS icons |
+| Pipeline configuration | `.github/workflows/deploy.yml` |
+| Monitoring screenshots | CloudWatch dashboard + alarm screenshots (Part 9) |
+| Load testing report | k6 output + CloudWatch correlation (Part 10–11) |
+| Security summary | Write up: IAM least-privilege role/policy used, SG rules (22 restricted to your IP, 80/443 open), HTTPS setup, S3 public access blocked |
+| Demo video | Screen-record: push to GitHub → pipeline runs → curl the live endpoint → show CloudWatch dashboard updating → run k6 test live |
+| Final report (PDF/DOCX) | Combine all of the above with setup steps, results, challenges faced (e.g., PM2 config, cert warnings), and improvements (ALB, Auto Scaling, containerization) |
+
+---
+
+## Common Pitfalls / Troubleshooting
+
+- **Can't SSH into EC2:** check Security Group allows your current IP (it changes if you're on a different network); check you used the right `.pem` file and `chmod 400`.
+- **App not reachable on port 80:** confirm Nginx is running (`sudo systemctl status nginx`) and PM2 shows the app as `online` (`pm2 list`).
+- **`aws s3 ls` fails with access denied:** IAM role isn't attached, or the custom S3 policy doesn't include the exact bucket ARN — double check for typos.
+- **GitHub Actions SSH step fails:** make sure `EC2_SSH_KEY` secret is the *raw private key contents* including `-----BEGIN...-----` and `-----END...-----` lines, no extra whitespace.
+- **CloudWatch Agent shows no custom metrics:** check `/opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log` for errors; confirm the IAM role has `CloudWatchAgentServerPolicy`.
+- **t2.micro underperforms badly under k6 load:** expected — it's a burstable, 1 vCPU free-tier instance. This is actually good material for your "bottlenecks" section.
